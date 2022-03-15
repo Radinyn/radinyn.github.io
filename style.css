@@ -1,7 +1,11 @@
 body {
-    background-color: #575948;
-    font-family: Serif
+    background-image: url(assets/background.svg);
+    background-repeat: no-repeat;
+    background-size: cover;
+    font-family: Serif;
 }
+
+/* #575948 */
 
 a {
     text-decoration: none;
@@ -9,7 +13,7 @@ a {
 }
 
 #container {
-    background-color: #575948;
+    background-color: transparent;
     width: 1100px;
     margin-left: auto;
     margin-right: auto;
