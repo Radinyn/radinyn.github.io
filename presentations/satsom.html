@@ -881,6 +881,19 @@ footer b{height:1px;flex:1;background:rgba(16,96,168,.22)}
     if(Date.now() - (window.__lastWheel || 0) < 650) return;
     window.__lastWheel = Date.now(); show(index + (e.deltaY > 0 ? 1 : -1));
   }, {passive:true});
+  let touchStartX = null, touchStartY = null;
+  addEventListener('touchstart', e => {
+    touchStartX = e.changedTouches[0].clientX;
+    touchStartY = e.changedTouches[0].clientY;
+  }, {passive:true});
+  addEventListener('touchend', e => {
+    if(touchStartX === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
+    touchStartX = touchStartY = null;
+    if(Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy)) return;
+    show(index + (dx < 0 ? 1 : -1));
+  }, {passive:true});
   document.querySelectorAll('[data-jump]').forEach(btn => btn.addEventListener('click', () => show(Number(btn.dataset.jump) - 1)));
   initSomViz();
   initKnobDemos();
