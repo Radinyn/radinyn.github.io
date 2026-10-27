@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Denoiser-3000</title>
+<title>Denoiser-3001</title>
 <style>
   :root {
     --fg: #1c1c1e;
@@ -124,11 +124,11 @@
 
 <div class="layout">
   <aside class="controls">
-    <h1>Denoiser-3000</h1>
+    <h1>Denoiser-3001</h1>
 
     <div class="field">
       <label for="file">Image or .zip</label>
-      <input type="file" id="file" accept="image/*,.zip,application/zip">
+      <input type="file" id="file" accept="image/*,.zip,application/zip,.lsm">
     </div>
 
     <div class="field">
@@ -143,6 +143,7 @@
 
     <div class="field">
       <button id="download" disabled>Download output image</button>
+      <button id="downloadHist" disabled>Download histogram (.tsv)</button>
       <button id="batch" disabled>Process all &amp; download ZIP</button>
       <button id="methodology">Methodology</button>
     </div>
@@ -198,8 +199,10 @@
       pixels become 0 (black).
     </li>
     <li>
-      <b>Write the file.</b> The result is saved as an 8-bit grayscale PNG at the
-      source resolution, with the original intensity scale preserved.
+      <b>Write the file.</b> Kept pixels are written with their original colour
+      and intensity, at the source resolution. PNG input gives a PNG; LSM input
+      gives an LSM again, written by copying the original file and replacing only
+      the pixel block, so all microscope metadata is preserved.
     </li>
   </ol>
   <form method="dialog"><button>Close</button></form>
@@ -239,42 +242,63 @@ function gaussianKernel(sigma) {
 function blur(src, w, h, sigma) {
   if (sigma <= 0) return src;
   const { kernel, radius } = gaussianKernel(sigma);
+  const taps = 2 * radius + 1;
   const tmp = new Float32Array(w * h);
   const out = new Float32Array(w * h);
+
+  // Mirror indices repeat for every row and every column, so resolve them once
+  // instead of computing a modulo inside each of the w*h*taps multiply-adds.
+  const xMap = new Int32Array(w * taps);
+  for (let x = 0; x < w; x++) {
+    for (let t = 0; t < taps; t++) xMap[x * taps + t] = reflectIndex(x + t - radius, w);
+  }
+  const yMap = new Int32Array(h * taps);
+  for (let y = 0; y < h; y++) {
+    for (let t = 0; t < taps; t++) yMap[y * taps + t] = reflectIndex(y + t - radius, h) * w;
+  }
 
   for (let y = 0; y < h; y++) {
     const row = y * w;
     for (let x = 0; x < w; x++) {
+      const base = x * taps;
       let acc = 0;
-      for (let t = -radius; t <= radius; t++) {
-        acc += kernel[t + radius] * src[row + reflectIndex(x + t, w)];
-      }
+      for (let t = 0; t < taps; t++) acc += kernel[t] * src[row + xMap[base + t]];
       tmp[row + x] = acc;
     }
   }
+
   for (let y = 0; y < h; y++) {
+    const base = y * taps;
+    const row = y * w;
     for (let x = 0; x < w; x++) {
       let acc = 0;
-      for (let t = -radius; t <= radius; t++) {
-        acc += kernel[t + radius] * tmp[reflectIndex(y + t, h) * w + x];
-      }
-      out[y * w + x] = acc;
+      for (let t = 0; t < taps; t++) acc += kernel[t] * tmp[yMap[base + t] + x];
+      out[row + x] = acc;
     }
   }
   return out;
 }
 
 /**
- * Smallest threshold whose surviving pixels carry at least `mass` of the total.
- * Walks the values from brightest downwards, so it reproduces the graphical
- * meaning of "keep the top N % of the intensity mass".
+ * Expensive half of the pipeline: blur, then sort once for the mass walk.
+ * Cached by the caller so dragging the mass slider never repeats it.
  */
-function massThreshold(values, mass) {
-  const sorted = Float64Array.from(values).sort();
+function prepare(intensity, w, h, sigma) {
+  const smoothed = blur(intensity, w, h, sigma);
+  const sorted = Float64Array.from(smoothed).sort();
   let total = 0;
   for (let i = 0; i < sorted.length; i++) total += sorted[i];
+  return { smoothed, sorted, total };
+}
 
-  const target = mass * total;
+/**
+ * Smallest threshold whose surviving pixels carry at least `mass` of the total.
+ * Walks the sorted values from brightest downwards, so it reproduces the
+ * graphical meaning of "keep the top N % of the intensity mass".
+ */
+function thresholdFor(prep, mass) {
+  const target = mass * prep.total;
+  const sorted = prep.sorted;
   let cumulative = 0;
   for (let i = sorted.length - 1; i >= 0; i--) {
     cumulative += sorted[i];
@@ -283,22 +307,26 @@ function massThreshold(values, mass) {
   return sorted[0];
 }
 
-/** Full pipeline: the Gaussian blur only decides the mask; output keeps raw values. */
-function applyFilter(intensity, w, h, sigma, mass) {
-  const smoothed = blur(intensity, w, h, sigma);
-  const threshold = massThreshold(smoothed, mass);
-
+/** Apply the mask; output pixels keep their original intensity. */
+function applyMask(intensity, prep, mass) {
+  const threshold = thresholdFor(prep, mass);
+  const smoothed = prep.smoothed;
   const out = new Float32Array(intensity.length);
   const mask = new Uint8Array(intensity.length);
   let kept = 0;
   for (let i = 0; i < smoothed.length; i++) {
     if (smoothed[i] >= threshold) {
-      out[i] = intensity[i];   // original value, never the smoothed one
+      out[i] = intensity[i];
       mask[i] = 1;
       kept++;
     }
   }
   return { smoothed, out, mask, threshold, retained: kept / smoothed.length };
+}
+
+/** One-shot wrapper used by the batch path. */
+function applyFilter(intensity, w, h, sigma, mass) {
+  return applyMask(intensity, prepare(intensity, w, h, sigma), mass);
 }
 
 /** 99.9th percentile on a subsample, used as the shared display range. */
@@ -440,6 +468,22 @@ function paint(canvas, source) {
   canvas.height = source.height;
   const ctx = canvas.getContext("2d");
   ctx.drawImage(source, 0, 0);
+}
+
+/**
+ * Raw histogram for export: one line per distinct intensity actually present,
+ * written as "{number of pixels}\t{intensity}". Sorted by intensity ascending.
+ */
+function histogramText(intensityArray) {
+  const counts = new Map();
+  for (let i = 0; i < intensityArray.length; i++) {
+    const v = intensityArray[i];
+    counts.set(v, (counts.get(v) || 0) + 1);
+  }
+  const keys = Array.from(counts.keys()).sort((a, b) => a - b);
+  let text = "";
+  for (const k of keys) text += `${counts.get(k)}\t${k}\n`;
+  return text;
 }
 
 /* Zoom panel: same crop of whichever tile the cursor is over. */
@@ -627,10 +671,178 @@ async function readZip(arrayBuffer) {
 }
 
 /* ------------------------------------------------------------------ *
+ * LSM (Zeiss) - TIFF container, uncompressed 16-bit preference
+ * ------------------------------------------------------------------ */
+
+const TIFF_TYPE_SIZE = {
+  1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8,
+};
+
+/** Walk the IFD chain, returning raw entries and the frame geometry. */
+function readTiffIfds(bytes) {
+  const little = bytes[0] === 0x49 && bytes[1] === 0x49;
+  if (!little && !(bytes[0] === 0x4d && bytes[1] === 0x4d)) {
+    throw new Error("Not a TIFF file");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const u16 = (o) => view.getUint16(o, little);
+  const u32 = (o) => view.getUint32(o, little);
+  if (u16(2) !== 42) throw new Error("Unsupported TIFF signature");
+
+  const frames = [];
+  let off = u32(4);
+  let guard = 0;
+
+  while (off && guard++ < 32) {
+    const count = u16(off);
+    const entries = [];
+    for (let i = 0; i < count; i++) {
+      const at = off + 2 + i * 12;
+      entries.push({ tag: u16(at), type: u16(at + 2), count: u32(at + 4), field: at + 8 });
+    }
+
+    const byTag = {};
+    for (const e of entries) byTag[e.tag] = e;
+
+    const readScalar = (tag, dflt) => {
+      const e = byTag[tag];
+      if (!e) return dflt;
+      const size = TIFF_TYPE_SIZE[e.type] || 1;
+      const inline = size * e.count <= 4;
+      const at = inline ? e.field : u32(e.field);
+      if (e.type === 3) return u16(at);
+      if (e.type === 4) return u32(at);
+      return dflt;
+    };
+
+    const width = readScalar(256, 0);
+    const height = readScalar(257, 0);
+    if (!width || !height) break;
+
+    // Sample layout from the first frame only.
+    const bitsPerSample = readScalar(258, 8);
+    const compression = readScalar(259, 1);
+    const samplesPerPixel = readScalar(277, 1);
+    const stripOffsetsTag = byTag[273];
+    const stripCountsTag = byTag[279];
+
+    const stripOffsets = [];
+    const stripCounts = [];
+    for (const [tag, out] of [[stripOffsetsTag, stripOffsets], [stripCountsTag, stripCounts]]) {
+      if (!tag) continue;
+      for (let i = 0; i < tag.count; i++) {
+        const size = TIFF_TYPE_SIZE[tag.type] || 4;
+        const inline = size * tag.count <= 4;
+        const base = inline ? tag.field : u32(tag.field);
+        out.push(tag.type === 3 ? u16(base + i * 2) : u32(base + i * 4));
+      }
+    }
+
+    frames.push({
+      width, height, bitsPerSample, compression, samplesPerPixel,
+      stripOffsets, stripCounts,
+    });
+
+    const next = off + 2 + count * 12;
+    off = u32(next);
+  }
+
+  if (!frames.length) throw new Error("No image frames found in TIFF");
+  return { frames, little };
+}
+
+/**
+ * Decode an LSM/TIFF. Intensities stay in their original numeric range (0-65535
+ * for 16-bit); the 8-bit version returned in `rgb` is only for display.
+ */
+function decodeTiff(bytes) {
+  const { frames, little } = readTiffIfds(bytes);
+  const zero = frames.find((f) => f.width > 128 && f.height > 128) || frames[0];
+
+  if (zero.compression !== 1) {
+    throw new Error("Compressed TIFF is not supported (LSM should be uncompressed)");
+  }
+  if (zero.samplesPerPixel !== 1) {
+    throw new Error("Only single-channel LSM images are supported");
+  }
+  if (zero.bitsPerSample !== 16 && zero.bitsPerSample !== 8) {
+    throw new Error(`Unsupported bit depth ${zero.bitsPerSample}`);
+  }
+
+  const { width: w, height: h, bitsPerSample: bits } = zero;
+  const n = w * h;
+  const is16 = bits === 16;
+  const raw = is16 ? new Uint16Array(n) : new Uint8Array(n);
+
+  let seen = 0;
+  for (let s = 0; s < zero.stripOffsets.length && seen < n; s++) {
+    const start = zero.stripOffsets[s];
+    const len = zero.stripCounts[s] || (n - seen) * (is16 ? 2 : 1);
+    const view = new DataView(bytes.buffer, bytes.byteOffset + start, len);
+    const count = Math.floor(len / (is16 ? 2 : 1));
+    for (let i = 0; i < count && seen < n; i++, seen++) {
+      raw[seen] = is16 ? view.getUint16(i * 2, little) : bytes[start + i];
+    }
+  }
+
+  // Intensities keep the file's own scale, so thresholds and exports are exact.
+  const values = new Float32Array(n);
+  let max = 0;
+  for (let i = 0; i < n; i++) {
+    const v = raw[i];
+    values[i] = v;
+    if (v > max) max = v;
+  }
+
+  // Display copy, scaled to 8 bits with one global factor.
+  const scale = max > 0 ? 255 / max : 0;
+  const rgb = new Uint8ClampedArray(n * 3);
+  for (let i = 0, k = 0; i < n; i++, k += 3) {
+    const v = Math.round(raw[i] * scale);
+    rgb[k] = v;
+    rgb[k + 1] = v;
+    rgb[k + 2] = v;
+  }
+
+  return { values, rgb, w, h, raw, bits, source: { bytes, frame: zero, little } };
+}
+
+/**
+ * Build a new LSM by copying the original file and overwriting only the pixel
+ * block, so every Zeiss metadata tag survives untouched.
+ */
+function encodeTiffFromSource(source, values, w, h) {
+  const { bytes, frame, little } = source;
+  if (frame.compression !== 1) throw new Error("Compressed LSM cannot be rewritten");
+  if (frame.bitsPerSample !== 16) throw new Error("Only 16-bit LSM can be rewritten");
+
+  const out = new Uint8Array(bytes.length);
+  out.set(bytes);
+  const view = new DataView(out.buffer);
+
+  const need = w * h;
+  let written = 0;
+  for (let s = 0; s < frame.stripOffsets.length && written < need; s++) {
+    const start = frame.stripOffsets[s];
+    const len = frame.stripCounts[s] || 0;
+    const count = Math.floor(len / 2);
+    for (let i = 0; i < count && written < need; i++, written++) {
+      const v = Math.max(0, Math.min(65535, Math.round(values[written])));
+      view.setUint16(start + i * 2, v, little);
+    }
+  }
+  return out;
+}
+
+
+
+/* ------------------------------------------------------------------ *
  * Application state
  * ------------------------------------------------------------------ */
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)$/i;
+const LSM_EXT = /\.lsm$/i;
+const READABLE_EXT = /\.(png|jpe?g|webp|gif|bmp|lsm)$/i;
 
 const el = {
   file: document.getElementById("file"),
@@ -639,6 +851,7 @@ const el = {
   sigmaOut: document.getElementById("sigmaOut"),
   massOut: document.getElementById("massOut"),
   download: document.getElementById("download"),
+  downloadHist: document.getElementById("downloadHist"),
   batch: document.getElementById("batch"),
   cIn: document.getElementById("cIn"),
   cMask: document.getElementById("cMask"),
@@ -653,12 +866,15 @@ const el = {
 const state = {
   name: null,
   archive: null,   // [{name, bytes}] when a zip was loaded
+  loaded: null,    // {values, rgb, w, h, source?} for the previewed image
   source: null,    // Float32Array of the previewed image intensity
   rgb: null,       // Uint8ClampedArray, original colour, 3 bytes per pixel
-  result: null,    // latest applyFilter() output
+  result: null,    // latest applyMask() output
+  prep: null,      // cached blur + sorted values, invalidated when sigma changes
   w: 0,
   h: 0,
   output: null,    // canvas holding the current output
+  outExt: "png",   // extension matching the input format
   busy: false,
   hover: null,     // {x, y} in image pixels, from the tile under the cursor
 };
@@ -700,13 +916,46 @@ async function canvasToBytes(canvas) {
   return new Uint8Array(await blob.arrayBuffer());
 }
 
+/** Load either a browser-decodable raster or an LSM/TIFF from raw bytes. */
+async function loadImage(name, blob) {
+  if (LSM_EXT.test(name)) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return decodeTiff(bytes);
+  }
+  return intensityFromBlob(blob);
+}
+
+/**
+ * Serialise a processed image. LSM input produces an LSM again (original file
+ * with the pixel block replaced); everything else produces a PNG.
+ */
+async function encodeOutput(loaded, result, w, h) {
+  if (loaded.source) {
+    return {
+      bytes: encodeTiffFromSource(loaded.source, result.out, w, h),
+      ext: "lsm",
+      // Deliberately not "image/tiff": browsers map that MIME type to a .tiff
+      // extension and override the download filename.
+      type: "application/octet-stream",
+    };
+  }
+  const canvas = colorCanvas(loaded.rgb, result.mask, w, h);
+  return { bytes: await canvasToBytes(canvas), ext: "png", type: "image/png" };
+}
+
 /* ------------------------------------------------------------------ *
  * Single-image preview
  * ------------------------------------------------------------------ */
 
 function render() {
   const { sigma, mass } = readSettings();
-  const result = applyFilter(state.source, state.w, state.h, sigma, mass);
+
+  // Re-blurring and re-sorting dominate the cost, so cache them per sigma.
+  if (!state.prep || state.prep.sigma !== sigma) {
+    state.prep = prepare(state.source, state.w, state.h, sigma);
+    state.prep.sigma = sigma;
+  }
+  const result = applyMask(state.source, state.prep, mass);
   state.result = result;
 
   // Colour is preserved: only the removal decision comes from the intensity.
@@ -727,6 +976,7 @@ function render() {
   drawZoom();
 
   el.download.disabled = false;
+  el.downloadHist.disabled = false;
   setStatus("");
 }
 
@@ -736,7 +986,7 @@ function render() {
 
 async function processArchive() {
   const { sigma, mass } = readSettings();
-  const images = state.archive.filter((f) => IMAGE_EXT.test(f.name));
+  const images = state.archive.filter((f) => READABLE_EXT.test(f.name));
   if (!images.length) {
     setStatus("The archive contains no readable images.");
     return;
@@ -752,11 +1002,21 @@ async function processArchive() {
 
     try {
       const blob = new Blob([images[i].bytes]);
-      const { values, rgb, w, h } = await intensityFromBlob(blob);
-      const result = applyFilter(values, w, h, sigma, mass);
-      const canvas = colorCanvas(rgb, result.mask, w, h);
-      const base = images[i].name.replace(IMAGE_EXT, "").replace(/^.*\//, "");
-      entries.push({ name: `${base}_masked.png`, data: await canvasToBytes(canvas) });
+      const loaded = await loadImage(images[i].name, blob);
+      const result = applyFilter(loaded.values, loaded.w, loaded.h, sigma, mass);
+      const out = await encodeOutput(loaded, result, loaded.w, loaded.h);
+      const base = images[i].name.replace(READABLE_EXT, "").replace(/^.*\//, "");
+      entries.push({ name: `images/${base}.${out.ext}`, data: out.bytes });
+
+      // Histogram of the retained pixels, same rows the preview plots.
+      const kept = [];
+      for (let p = 0; p < result.out.length; p++) {
+        if (result.mask[p]) kept.push(result.out[p]);
+      }
+      entries.push({
+        name: `histograms/${base}.tsv`,
+        data: new TextEncoder().encode(histogramText(kept)),
+      });
     } catch (err) {
       console.warn("skipping", images[i].name, err);
     }
@@ -768,7 +1028,7 @@ async function processArchive() {
 
   state.busy = false;
   el.batch.disabled = false;
-  setStatus(`Wrote ${entries.length} masked images to masked_images.zip.`);
+  setStatus(`Wrote ${entries.length / 2} images and histograms to masked_images.zip.`);
 }
 
 function triggerDownload(blob, filename) {
@@ -792,31 +1052,37 @@ el.file.addEventListener("change", async () => {
 
   state.archive = null;
   state.name = file.name;
+  state.prep = null;   // new pixels: drop the cached blur
   el.batch.disabled = true;
+  el.downloadHist.disabled = true;
   setStatus(`Loading ${file.name} …`);
 
   try {
     if (/\.zip$/i.test(file.name) || file.type === "application/zip") {
       const entries = await readZip(await file.arrayBuffer());
-      const images = entries.filter((f) => IMAGE_EXT.test(f.name));
+      const images = entries.filter((f) => READABLE_EXT.test(f.name));
       if (!images.length) {
         setStatus("The archive contains no readable images.");
         return;
       }
       state.archive = entries;
       state.name = images[0].name;
-      const first = await intensityFromBlob(new Blob([images[0].bytes]));
+      const first = await loadImage(images[0].name, new Blob([images[0].bytes]));
+      state.loaded = first;
       state.source = first.values;
       state.rgb = first.rgb;
       state.w = first.w;
       state.h = first.h;
+      state.outExt = first.source ? "lsm" : "png";
       el.batch.disabled = false;
     } else {
-      const loaded = await intensityFromBlob(file);
+      const loaded = await loadImage(file.name, file);
+      state.loaded = loaded;
       state.source = loaded.values;
       state.rgb = loaded.rgb;
       state.w = loaded.w;
       state.h = loaded.h;
+      state.outExt = loaded.source ? "lsm" : "png";
     }
     render();
   } catch (err) {
@@ -841,10 +1107,22 @@ el.mass.addEventListener("input", () => {
 });
 
 el.download.addEventListener("click", async () => {
-  if (!state.output) return;
-  const bytes = await canvasToBytes(state.output);
+  if (!state.loaded || !state.result) return;
+  const out = await encodeOutput(state.loaded, state.result, state.w, state.h);
+  const base = (state.name || "image").replace(READABLE_EXT, "").replace(/^.*\//, "");
+  triggerDownload(new Blob([out.bytes], { type: out.type }), `${base}_masked.${out.ext}`);
+});
+
+el.downloadHist.addEventListener("click", () => {
+  if (!state.result) return;
+  const kept = [];
+  for (let i = 0; i < state.result.out.length; i++) {
+    if (state.result.mask[i]) kept.push(state.result.out[i]);
+  }
   const base = (state.name || "image").replace(IMAGE_EXT, "").replace(/^.*\//, "");
-  triggerDownload(new Blob([bytes], { type: "image/png" }), `${base}_masked.png`);
+  const text = histogramText(kept);
+  triggerDownload(new Blob([text], { type: "text/tab-separated-values" }),
+                  `${base}_histogram.tsv`);
 });
 
 el.batch.addEventListener("click", () => {
