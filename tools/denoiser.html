@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Denoiser-3000</title>
+<style>
+  :root {
+    --fg: #1c1c1e;
+    --muted: #6b7280;
+    --line: #d8dade;
+    --bg: #fafafa;
+    --accent: #2d6cdf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  .hint { margin: 0 0 20px; color: var(--muted); max-width: 70ch; }
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    gap: 24px;
+    align-items: start;
+    max-width: 1500px;
+  }
+  .controls { display: flex; flex-direction: column; gap: 16px; }
+  .controls h1 {
+    margin: 0 0 4px;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    line-height: 1.3;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field > label { font-size: 13px; display: flex; justify-content: space-between; }
+  .field output { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  input[type="file"] { width: 100%; font-size: 12px; }
+  button {
+    font: inherit;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .status {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    min-height: 3em;
+    white-space: pre-line;
+  }
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    align-content: start;
+    align-items: start;
+  }
+  figure {
+    margin: 0;
+    min-width: 0;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  figcaption {
+    padding: 6px 8px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+  }
+  /* Square tiles: the data is 640x640, so the panels keep that 1:1 geometry. */
+  .tile canvas { aspect-ratio: 1 / 1; }
+  canvas { display: block; width: 100%; height: auto; background: #f0f0f0; }
+  #cMask { image-rendering: pixelated; }
+  .zoom canvas {
+    aspect-ratio: 1 / 1;
+    image-rendering: pixelated;
+    background: #111;
+  }
+  .chart canvas { aspect-ratio: 1 / 1; }
+  dialog {
+    max-width: 68ch;
+    padding: 24px 28px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--fg);
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .35); }
+  dialog h2 { margin: 0 0 12px; font-size: 16px; }
+  dialog ol { margin: 0 0 16px; padding-left: 20px; }
+  dialog li { margin-bottom: 8px; }
+  dialog li > b { font-weight: 600; }
+  dialog code {
+    font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    background: #f2f3f5;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  dialog .note {
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    background: #f7f8fa;
+    border-left: 3px solid var(--accent);
+    font-size: 13px;
+  }
+  dialog form { margin: 0; text-align: right; }
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <aside class="controls">
+    <h1>Denoiser-3000</h1>
+
+    <div class="field">
+      <label for="file">Image or .zip</label>
+      <input type="file" id="file" accept="image/*,.zip,application/zip">
+    </div>
+
+    <div class="field">
+      <label for="sigma">Gaussian kernel size (&sigma;) <output id="sigmaOut">2</output></label>
+      <input type="range" id="sigma" min="0" max="10" step="0.5" value="2">
+    </div>
+
+    <div class="field">
+      <label for="mass">Mass cutoff <output id="massOut">50%</output></label>
+      <input type="range" id="mass" min="0" max="100" step="1" value="50">
+    </div>
+
+    <div class="field">
+      <button id="download" disabled>Download output image</button>
+      <button id="batch" disabled>Process all &amp; download ZIP</button>
+      <button id="methodology">Methodology</button>
+    </div>
+  </aside>
+
+  <section class="panels">
+    <figure class="tile" data-view="in">
+      <figcaption>Input</figcaption><canvas id="cIn"></canvas>
+    </figure>
+    <figure class="tile" data-view="mask">
+      <figcaption>Mask (white = kept)</figcaption><canvas id="cMask"></canvas>
+    </figure>
+    <figure class="tile" data-view="out">
+      <figcaption>Output</figcaption><canvas id="cOut"></canvas>
+    </figure>
+    <figure class="chart"><figcaption>Histogram: input (all pixels)</figcaption><canvas id="hIn"></canvas></figure>
+    <figure class="zoom">
+      <figcaption>Zoom</figcaption>
+      <canvas id="cZoom"></canvas>
+    </figure>
+    <figure class="chart">
+      <figcaption>Histogram: output (kept pixels)</figcaption>
+      <canvas id="hOut"></canvas>
+    </figure>
+  </section>
+</div>
+
+<dialog id="methodologyDialog">
+  <h2>How the output is produced</h2>
+  <ol>
+    <li>
+      <b>Read the intensity.</b> For every pixel take the largest of its red,
+      green and blue values. These slides are single-channel fluorescence, so
+      this is the signal channel.
+    </li>
+    <li>
+      <b>Smooth.</b> Blur the intensities with a separable Gaussian of the
+      chosen kernel size &sigma; (mirror padding at the edges); &sigma; = 0 skips
+      this step.
+    </li>
+    <li>
+      <b>Total the intensity.</b> Add up all pixel values of the blurred image.
+      This total is the mass.
+    </li>
+    <li>
+      <b>Pick the threshold.</b> Walk the pixel values from brightest to
+      dimmest, accumulating them, until the running sum reaches the chosen share
+      of the mass (50% by default). The value you stopped on is the threshold.
+    </li>
+    <li>
+      <b>Apply the mask.</b> A pixel is kept when its blurred value reaches the
+      threshold, and it is written out with its original intensity. Removed
+      pixels become 0 (black).
+    </li>
+    <li>
+      <b>Write the file.</b> The result is saved as an 8-bit grayscale PNG at the
+      source resolution, with the original intensity scale preserved.
+    </li>
+  </ol>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Image maths
+ * ------------------------------------------------------------------ */
+
+/** Mirror index into [0, n) without repeating the edge sample (scipy "reflect"). */
+function reflectIndex(i, n) {
+  if (n === 1) return 0;
+  const period = 2 * n;
+  let j = i % period;
+  if (j < 0) j += period;
+  return j < n ? j : period - j - 1;
+}
+
+function gaussianKernel(sigma) {
+  const radius = Math.max(1, Math.ceil(sigma * 4));
+  const kernel = new Float64Array(2 * radius + 1);
+  const twoSigmaSq = 2 * sigma * sigma;
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    const v = Math.exp(-(i * i) / twoSigmaSq);
+    kernel[i + radius] = v;
+    sum += v;
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= sum;
+  return { kernel, radius };
+}
+
+/** Separable Gaussian blur. sigma <= 0 returns the input untouched. */
+function blur(src, w, h, sigma) {
+  if (sigma <= 0) return src;
+  const { kernel, radius } = gaussianKernel(sigma);
+  const tmp = new Float32Array(w * h);
+  const out = new Float32Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let t = -radius; t <= radius; t++) {
+        acc += kernel[t + radius] * src[row + reflectIndex(x + t, w)];
+      }
+      tmp[row + x] = acc;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let t = -radius; t <= radius; t++) {
+        acc += kernel[t + radius] * tmp[reflectIndex(y + t, h) * w + x];
+      }
+      out[y * w + x] = acc;
+    }
+  }
+  return out;
+}
+
+/**
+ * Smallest threshold whose surviving pixels carry at least `mass` of the total.
+ * Walks the values from brightest downwards, so it reproduces the graphical
+ * meaning of "keep the top N % of the intensity mass".
+ */
+function massThreshold(values, mass) {
+  const sorted = Float64Array.from(values).sort();
+  let total = 0;
+  for (let i = 0; i < sorted.length; i++) total += sorted[i];
+
+  const target = mass * total;
+  let cumulative = 0;
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    cumulative += sorted[i];
+    if (cumulative >= target) return sorted[i];
+  }
+  return sorted[0];
+}
+
+/** Full pipeline: the Gaussian blur only decides the mask; output keeps raw values. */
+function applyFilter(intensity, w, h, sigma, mass) {
+  const smoothed = blur(intensity, w, h, sigma);
+  const threshold = massThreshold(smoothed, mass);
+
+  const out = new Float32Array(intensity.length);
+  const mask = new Uint8Array(intensity.length);
+  let kept = 0;
+  for (let i = 0; i < smoothed.length; i++) {
+    if (smoothed[i] >= threshold) {
+      out[i] = intensity[i];   // original value, never the smoothed one
+      mask[i] = 1;
+      kept++;
+    }
+  }
+  return { smoothed, out, mask, threshold, retained: kept / smoothed.length };
+}
+
+/** 99.9th percentile on a subsample, used as the shared display range. */
+function displayMax(values) {
+  const stride = Math.max(1, Math.floor(values.length / 50000));
+  const sample = [];
+  for (let i = 0; i < values.length; i += stride) sample.push(values[i]);
+  sample.sort((a, b) => a - b);
+  return Math.max(1, sample[Math.floor((sample.length - 1) * 0.999)]);
+}
+
+/* ------------------------------------------------------------------ *
+ * Rendering
+ * ------------------------------------------------------------------ */
+
+/** Original colour, with removed pixels set to black. */
+function colorCanvas(rgb, mask, w, h) {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let i = 0, j = 0, k = 0; i < mask.length; i++, j += 4, k += 3) {
+    if (mask[i]) {
+      img.data[j] = rgb[k];
+      img.data[j + 1] = rgb[k + 1];
+      img.data[j + 2] = rgb[k + 2];
+    }
+    img.data[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function sourceCanvas(rgb, w, h) {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let i = 0, j = 0, k = 0; i < w * h; i++, j += 4, k += 3) {
+    img.data[j] = rgb[k];
+    img.data[j + 1] = rgb[k + 1];
+    img.data[j + 2] = rgb[k + 2];
+    img.data[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function maskCanvas(mask, w, h) {
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
+    const v = mask[i] ? 255 : 0;
+    img.data[j] = v;
+    img.data[j + 1] = v;
+    img.data[j + 2] = v;
+    img.data[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function drawHistogram(canvas, values, maxValue, marker) {
+  // Draw at the element's real size so text is not scaled down by CSS.
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(200, Math.round(canvas.clientWidth || 300));
+  const H = Math.max(140, Math.round(canvas.clientHeight || W * 0.62));
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, W, H);
+
+  const pad = { left: 46, right: 12, top: 12, bottom: 26 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+  const bins = 90;
+
+  const counts = new Uint32Array(bins);
+  if (values && values.length) {
+    for (let i = 0; i < values.length; i++) {
+      let b = Math.floor((values[i] / maxValue) * bins);
+      if (b < 0) b = 0;
+      else if (b >= bins) b = bins - 1;
+      counts[b]++;
+    }
+  }
+  let peak = 1;
+  for (let i = 0; i < bins; i++) if (counts[i] > peak) peak = counts[i];
+
+  ctx.strokeStyle = "#d8dade";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top);
+  ctx.lineTo(pad.left, pad.top + plotH);
+  ctx.lineTo(pad.left + plotW, pad.top + plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = "#2d6cdf";
+  const barW = plotW / bins;
+  for (let i = 0; i < bins; i++) {
+    if (!counts[i]) continue;
+    const barH = (counts[i] / peak) * plotH;
+    ctx.fillRect(pad.left + i * barW, pad.top + plotH - barH,
+                 Math.max(1, barW - 0.5), barH);
+  }
+
+  if (marker != null) {
+    const x = pad.left + Math.min(1, marker / maxValue) * plotW;
+    ctx.strokeStyle = "#d13438";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.top);
+    ctx.lineTo(x, pad.top + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = "#6b7280";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.fillText("0", pad.left - 3, H - 9);
+  ctx.textAlign = "right";
+  ctx.fillText(String(Math.round(maxValue)), pad.left + plotW, H - 9);
+  ctx.fillText(String(peak), pad.left - 6, pad.top + 8);
+  ctx.textAlign = "left";
+  ctx.fillText("0", pad.left - 6, pad.top + plotH);
+}
+
+function paint(canvas, source) {
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(source, 0, 0);
+}
+
+/* Zoom panel: same crop of whichever tile the cursor is over. */
+
+const ZOOM_SOURCE = 72;   // size of the sampled region, in image pixels
+
+function drawZoom() {
+  const canvas = el.cZoom;
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(160, Math.round(canvas.clientWidth || 320));
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(W * dpr);
+  canvas.style.height = `${W}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  if (!state.source || !state.hover) {
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, W, W);
+    return;
+  }
+
+  const { x, y } = state.hover;
+  const half = Math.floor(ZOOM_SOURCE / 2);
+  const x0 = Math.max(0, Math.min(state.w - ZOOM_SOURCE, x - half));
+  const y0 = Math.max(0, Math.min(state.h - ZOOM_SOURCE, y - half));
+
+  const view = state.zoomView || "in";
+  const src =
+    view === "mask" ? maskCanvas(state.result.mask, state.w, state.h)
+    : view === "out" ? colorCanvas(state.rgb, state.result.mask, state.w, state.h)
+    : sourceCanvas(state.rgb, state.w, state.h);
+
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, W, W);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(src, x0, y0, ZOOM_SOURCE, ZOOM_SOURCE, 0, 0, W, W);
+}
+
+/* ------------------------------------------------------------------ *
+ * ZIP (store-only writer, store/deflate reader)
+ * ------------------------------------------------------------------ */
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ bytes[i]) & 0xff];
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function makeZip(entries) {
+  const encoder = new TextEncoder();
+  const parts = [];
+  const central = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const crc = crc32(entry.data);
+
+    const local = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(local.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0, true);
+    lv.setUint16(8, 0, true);            // stored, no compression
+    lv.setUint16(10, 0, true);
+    lv.setUint16(12, 0x21, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, entry.data.length, true);
+    lv.setUint32(22, entry.data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    local.set(nameBytes, 30);
+
+    parts.push(local, entry.data);
+
+    const dir = new Uint8Array(46 + nameBytes.length);
+    const dv = new DataView(dir.buffer);
+    dv.setUint32(0, 0x02014b50, true);
+    dv.setUint16(4, 20, true);
+    dv.setUint16(6, 20, true);
+    dv.setUint16(8, 0, true);
+    dv.setUint16(10, 0, true);
+    dv.setUint16(12, 0, true);
+    dv.setUint16(14, 0x21, true);
+    dv.setUint32(16, crc, true);
+    dv.setUint32(20, entry.data.length, true);
+    dv.setUint32(24, entry.data.length, true);
+    dv.setUint16(28, nameBytes.length, true);
+    dv.setUint16(30, 0, true);
+    dv.setUint16(32, 0, true);
+    dv.setUint16(34, 0, true);
+    dv.setUint16(36, 0, true);
+    dv.setUint32(38, 0, true);
+    dv.setUint32(42, offset, true);
+    dir.set(nameBytes, 46);
+    central.push(dir);
+
+    offset += local.length + entry.data.length;
+  }
+
+  const centralSize = central.reduce((sum, c) => sum + c.length, 0);
+  const end = new Uint8Array(22);
+  const ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+
+  const all = parts.concat(central, [end]);
+  const total = all.reduce((sum, chunk) => sum + chunk.length, 0);
+  const zip = new Uint8Array(total);
+  let pos = 0;
+  for (const chunk of all) {
+    zip.set(chunk, pos);
+    pos += chunk.length;
+  }
+  return zip;
+}
+
+async function inflateRaw(bytes) {
+  const stream = new Blob([bytes]).stream()
+    .pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function readZip(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+
+  let eocd = -1;
+  const lowest = Math.max(0, bytes.length - 22 - 0xffff);
+  for (let i = bytes.length - 22; i >= lowest; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error("Not a zip archive");
+
+  const count = view.getUint16(eocd + 10, true);
+  const decoder = new TextDecoder();
+  const files = [];
+  let p = view.getUint32(eocd + 16, true);
+
+  for (let i = 0; i < count; i++) {
+    if (view.getUint32(p, true) !== 0x02014b50) throw new Error("Corrupt zip directory");
+    const method = view.getUint16(p + 10, true);
+    const compressedSize = view.getUint32(p + 20, true);
+    const nameLen = view.getUint16(p + 28, true);
+    const extraLen = view.getUint16(p + 30, true);
+    const commentLen = view.getUint16(p + 32, true);
+    const localOffset = view.getUint32(p + 42, true);
+    const name = decoder.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+    p += 46 + nameLen + extraLen + commentLen;
+
+    if (name.endsWith("/")) continue;
+
+    const localNameLen = view.getUint16(localOffset + 26, true);
+    const localExtraLen = view.getUint16(localOffset + 28, true);
+    const start = localOffset + 30 + localNameLen + localExtraLen;
+    const raw = bytes.subarray(start, start + compressedSize);
+
+    let data;
+    if (method === 0) data = raw;
+    else if (method === 8) data = await inflateRaw(raw);
+    else continue;
+
+    files.push({ name, bytes: data });
+  }
+  return files;
+}
+
+/* ------------------------------------------------------------------ *
+ * Application state
+ * ------------------------------------------------------------------ */
+
+const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)$/i;
+
+const el = {
+  file: document.getElementById("file"),
+  sigma: document.getElementById("sigma"),
+  mass: document.getElementById("mass"),
+  sigmaOut: document.getElementById("sigmaOut"),
+  massOut: document.getElementById("massOut"),
+  download: document.getElementById("download"),
+  batch: document.getElementById("batch"),
+  cIn: document.getElementById("cIn"),
+  cMask: document.getElementById("cMask"),
+  cOut: document.getElementById("cOut"),
+  cZoom: document.getElementById("cZoom"),
+  methodology: document.getElementById("methodology"),
+  methodologyDialog: document.getElementById("methodologyDialog"),
+  hIn: document.getElementById("hIn"),
+  hOut: document.getElementById("hOut"),
+};
+
+const state = {
+  name: null,
+  archive: null,   // [{name, bytes}] when a zip was loaded
+  source: null,    // Float32Array of the previewed image intensity
+  rgb: null,       // Uint8ClampedArray, original colour, 3 bytes per pixel
+  result: null,    // latest applyFilter() output
+  w: 0,
+  h: 0,
+  output: null,    // canvas holding the current output
+  busy: false,
+  hover: null,     // {x, y} in image pixels, from the tile under the cursor
+};
+
+function setStatus(text) {
+  // Progress and errors surface on the batch button, which is where they are
+  // actionable; there is no free-floating status text in the layout.
+  if (text) el.batch.title = text;
+}
+
+function readSettings() {
+  return { sigma: Number(el.sigma.value), mass: Number(el.mass.value) / 100 };
+}
+
+async function intensityFromBlob(blob) {
+  const bitmap = await createImageBitmap(blob);
+  const { width: w, height: h } = bitmap;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0);
+  const { data } = ctx.getImageData(0, 0, w, h);
+  bitmap.close();
+
+  const values = new Float32Array(w * h);
+  const rgb = new Uint8ClampedArray(w * h * 3);
+  for (let i = 0, j = 0, k = 0; i < values.length; i++, j += 4, k += 3) {
+    values[i] = Math.max(data[j], data[j + 1], data[j + 2]);
+    rgb[k] = data[j];
+    rgb[k + 1] = data[j + 1];
+    rgb[k + 2] = data[j + 2];
+  }
+  return { values, rgb, w, h };
+}
+
+async function canvasToBytes(canvas) {
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+/* ------------------------------------------------------------------ *
+ * Single-image preview
+ * ------------------------------------------------------------------ */
+
+function render() {
+  const { sigma, mass } = readSettings();
+  const result = applyFilter(state.source, state.w, state.h, sigma, mass);
+  state.result = result;
+
+  // Colour is preserved: only the removal decision comes from the intensity.
+  paint(el.cIn, sourceCanvas(state.rgb, state.w, state.h));
+  paint(el.cMask, maskCanvas(result.mask, state.w, state.h));
+
+  const output = colorCanvas(state.rgb, result.mask, state.w, state.h);
+  paint(el.cOut, output);
+  state.output = output;
+
+  const kept = [];
+  for (let i = 0; i < result.out.length; i++) {
+    if (result.mask[i]) kept.push(result.out[i]);
+  }
+  const maxValue = displayMax(state.source);
+  drawHistogram(el.hIn, state.source, maxValue, result.threshold);
+  drawHistogram(el.hOut, kept, maxValue, null);
+  drawZoom();
+
+  el.download.disabled = false;
+  setStatus("");
+}
+
+/* ------------------------------------------------------------------ *
+ * Archive processing
+ * ------------------------------------------------------------------ */
+
+async function processArchive() {
+  const { sigma, mass } = readSettings();
+  const images = state.archive.filter((f) => IMAGE_EXT.test(f.name));
+  if (!images.length) {
+    setStatus("The archive contains no readable images.");
+    return;
+  }
+
+  state.busy = true;
+  el.batch.disabled = true;
+
+  const entries = [];
+  for (let i = 0; i < images.length; i++) {
+    setStatus(`Processing ${i + 1} / ${images.length}: ${images[i].name}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    try {
+      const blob = new Blob([images[i].bytes]);
+      const { values, rgb, w, h } = await intensityFromBlob(blob);
+      const result = applyFilter(values, w, h, sigma, mass);
+      const canvas = colorCanvas(rgb, result.mask, w, h);
+      const base = images[i].name.replace(IMAGE_EXT, "").replace(/^.*\//, "");
+      entries.push({ name: `${base}_masked.png`, data: await canvasToBytes(canvas) });
+    } catch (err) {
+      console.warn("skipping", images[i].name, err);
+    }
+  }
+
+  const zip = makeZip(entries);
+  const blob = new Blob([zip], { type: "application/zip" });
+  triggerDownload(blob, "masked_images.zip");
+
+  state.busy = false;
+  el.batch.disabled = false;
+  setStatus(`Wrote ${entries.length} masked images to masked_images.zip.`);
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/* ------------------------------------------------------------------ *
+ * Wiring
+ * ------------------------------------------------------------------ */
+
+el.file.addEventListener("change", async () => {
+  const file = el.file.files && el.file.files[0];
+  if (!file) return;
+
+  state.archive = null;
+  state.name = file.name;
+  el.batch.disabled = true;
+  setStatus(`Loading ${file.name} …`);
+
+  try {
+    if (/\.zip$/i.test(file.name) || file.type === "application/zip") {
+      const entries = await readZip(await file.arrayBuffer());
+      const images = entries.filter((f) => IMAGE_EXT.test(f.name));
+      if (!images.length) {
+        setStatus("The archive contains no readable images.");
+        return;
+      }
+      state.archive = entries;
+      state.name = images[0].name;
+      const first = await intensityFromBlob(new Blob([images[0].bytes]));
+      state.source = first.values;
+      state.rgb = first.rgb;
+      state.w = first.w;
+      state.h = first.h;
+      el.batch.disabled = false;
+    } else {
+      const loaded = await intensityFromBlob(file);
+      state.source = loaded.values;
+      state.rgb = loaded.rgb;
+      state.w = loaded.w;
+      state.h = loaded.h;
+    }
+    render();
+  } catch (err) {
+    console.error(err);
+    setStatus(`Could not read the file: ${err.message}`);
+  }
+});
+
+function updateSliderLabels() {
+  el.sigmaOut.textContent = el.sigma.value;
+  el.massOut.textContent = `${el.mass.value}%`;
+}
+
+el.sigma.addEventListener("input", () => {
+  updateSliderLabels();
+  if (state.source && !state.busy) render();
+});
+
+el.mass.addEventListener("input", () => {
+  updateSliderLabels();
+  if (state.source && !state.busy) render();
+});
+
+el.download.addEventListener("click", async () => {
+  if (!state.output) return;
+  const bytes = await canvasToBytes(state.output);
+  const base = (state.name || "image").replace(IMAGE_EXT, "").replace(/^.*\//, "");
+  triggerDownload(new Blob([bytes], { type: "image/png" }), `${base}_masked.png`);
+});
+
+el.batch.addEventListener("click", () => {
+  if (state.archive) processArchive();
+});
+
+el.methodology.addEventListener("click", () => {
+  if (typeof el.methodologyDialog.showModal === "function") {
+    el.methodologyDialog.showModal();
+  }
+});
+
+// Hovering a tile moves the same crop into the zoom panel.
+for (const figure of document.querySelectorAll(".tile")) {
+  const canvas = figure.querySelector("canvas");
+
+  figure.addEventListener("mousemove", (event) => {
+    if (!state.source) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = Math.floor(((event.clientX - rect.left) / rect.width) * state.w);
+    const y = Math.floor(((event.clientY - rect.top) / rect.height) * state.h);
+    state.hover = {
+      x: Math.max(0, Math.min(state.w - 1, x)),
+      y: Math.max(0, Math.min(state.h - 1, y)),
+    };
+    state.zoomView = figure.dataset.view;
+    drawZoom();
+  });
+}
+
+updateSliderLabels();
+</script>
+</body>
+</html>
