@@ -56,6 +56,11 @@ a:hover {
     list-style-type: none;
 }
 
+#main ul.bullets {
+    list-style-type: disc;
+    padding-left: 20px;
+}
+
 #main li {
     margin: 5px 0;
 }
